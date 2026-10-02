@@ -1,8 +1,10 @@
 //! Contains core implementation for contracts multisig
 
+use std::fmt;
 use std::vec;
 
 use crate::utils::*;
+use indexmap::IndexSet;
 
 use bitcoin::absolute::LockTime;
 use bitcoin::script::Builder;
@@ -30,17 +32,17 @@ pub struct MultisigScript {
     pub weight: usize,
     /// The script raw data
     pub leaf: ScriptBuf,
-    /// Public keys combination that matches with current script
-    pub combination: Vec<PublicKey>,
+    /// X-only public keys that match with the current script
+    pub combination: Vec<XOnlyPublicKey>,
 }
 
 /// Required data to create multisig
 #[derive(Debug, Clone)]
 pub struct MultisigData {
     /// The public key list from contractors (involved parts)
-    pub parts: Vec<PublicKey>,
+    pub parts: IndexSet<XOnlyPublicKey>,
     /// The publc key list from contract arbitrators
-    pub arbitrators: Vec<PublicKey>,
+    pub arbitrators: IndexSet<XOnlyPublicKey>,
     /// Quorum of minimal necessary arbitrators to unlock funds
     pub quorum: usize,
     /// Internal public key. It's a critical data.
@@ -69,6 +71,53 @@ pub struct SpendingData {
     pub lock_time: Option<LockTime>,
 }
 
+/// Errors returned when preparing a multisig spend.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SpendingError {
+    /// The requested script is not a leaf in this multisig's Taproot tree.
+    ScriptNotFound,
+}
+
+impl fmt::Display for SpendingError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::ScriptNotFound => write!(f, "spending script is not in this multisig tree"),
+        }
+    }
+}
+
+impl std::error::Error for SpendingError {}
+
+/// Errors returned when creating a multisig.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MultisigError {
+    /// The arbitrator quorum must be greater than zero.
+    QuorumZero,
+    /// A public key is configured as both a part and an arbitrator.
+    ArbitratorIsPart(XOnlyPublicKey),
+    /// Quorum is greater than arbitrators length.
+    QuorumGreaterThanArbitratorsLength,
+}
+
+impl fmt::Display for MultisigError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::QuorumZero => write!(f, "arbitrator quorum must be greater than zero"),
+            Self::ArbitratorIsPart(key) => {
+                write!(f, "arbitrator key is also configured as a part: {key}")
+            }
+            Self::QuorumGreaterThanArbitratorsLength => {
+                write!(
+                    f,
+                    "arbitrator quorum must be equal or greater than arbitrators length"
+                )
+            }
+        }
+    }
+}
+
+impl std::error::Error for MultisigError {}
+
 /// Multisig implementation.
 #[derive(Debug, Clone)]
 pub struct Multisig {
@@ -87,23 +136,26 @@ impl Multisig {
     /// # Args
     /// - `data`([MultisigData]): Data to multisig generation
     /// # Returns
-    /// Created multisig struct
+    /// Created multisig struct, or a configuration error.
     /// # Example
     /// ```ignore
     /// use std::vec;
-    /// use secp256k1::{PublicKey};
+    /// use indexmap::IndexSet
+    /// use secp256k1::{XOnlyPublicKey};
     /// use bitcoin::{Network};
     /// use pls_bitcoin_lib::{Multisig, MultisigData};
     ///
-    /// let parts = vec![
-    ///     PublicKey::from_str("02b55f16363d70ae5034cc39554e8ce151254ab380bed2029cc7344807c22e6c1b"),
-    ///     PublicKey::from_str("038677177e7ce4f8090f07661ac39636e4ea921bf28f7e45ba24dcf6ea56aa5f97"),
+    /// let parts_str = vec![
+    ///     "b55f16363d70ae5034cc39554e8ce151254ab380bed2029cc7344807c22e6c1b",
+    ///     "8677177e7ce4f8090f07661ac39636e4ea921bf28f7e45ba24dcf6ea56aa5f97",
     /// ];
     ///
-    /// let arbitrators = vec![PublicKey::from_str("03017f1ce0d34892be7e930c8eea77f54ce300386dea5e883bf1da60f47d64f547")];
+    /// let parts: IndexSet<XOnlyPublicKey> = parts_str.iter().map(|str| XOnlyPublicKey::from_str(str).unwrap()).collect();
+    ///
+    /// let arbitrators: IndexSet<XOnlyPublicKey> = [XOnlyPublicKey::from_str("03017f1ce0d34892be7e930c8eea77f54ce300386dea5e883bf1da60f47d64f547").unwrap()].into();
     ///
     /// // Internal public key for constructing the multisig
-    /// let internal_pubkey = PublicKey::from_str("03af0c7e8b8cf586f762ce1377a51fc6b7228a9caed4a5dcb43b180acf6824f7c9");
+    /// let internal_pubkey = PublicKey::from_str("03af0c7e8b8cf586f762ce1377a51fc6b7228a9caed4a5dcb43b180acf6824f7c9").unwrap();
     ///
     /// // Minimal arbitrators signatures to unlock with one of the parts
     /// let quorum = 1;
@@ -116,19 +168,38 @@ impl Multisig {
     ///     quorum,
     ///     internal_pubkey,
     ///     network,
-    /// });
+    /// }).expect("valid multisig configuration");
     ///
     /// // Should prints "bcrt1pu0z0pwk4jn3naucadmr8gz9eh2xd3ts5shkat9vkslkms44hpavsvcdleq"
     /// println!(multisig.address().to_string());
     /// ```
-    pub fn new(data: MultisigData) -> Multisig {
+    pub fn new(data: MultisigData) -> Result<Multisig, MultisigError> {
+        if data.quorum == 0 {
+            return Err(MultisigError::QuorumZero);
+        }
+
+        if data.quorum > data.arbitrators.len() {
+            return Err(MultisigError::QuorumGreaterThanArbitratorsLength);
+        }
+
+        for arbitrator in &data.arbitrators {
+            if data.parts.contains(arbitrator) {
+                return Err(MultisigError::ArbitratorIsPart(*arbitrator));
+            }
+        }
+
         let secp = Secp256k1::new();
 
-        // Create scripts arrays with each combination for each cases
-        let mut keys_combination: Vec<Vec<PublicKey>> = vec![data.parts.clone()];
+        // Preserve insertion order because script order determines the multisig address.
+        // IndexSet preserves insertion order, which determines the generated scripts.
+        let parts: Vec<XOnlyPublicKey> = data.parts.into_iter().collect();
+        let arbitrators: Vec<XOnlyPublicKey> = data.arbitrators.into_iter().collect();
 
-        data.parts.into_iter().for_each(|part| {
-            let mut arbitrators_combinations = combine(&data.arbitrators, data.quorum);
+        // Create scripts arrays with each combination for each cases
+        let mut keys_combination: Vec<Vec<XOnlyPublicKey>> = vec![parts.clone()];
+
+        parts.into_iter().for_each(|part| {
+            let mut arbitrators_combinations = combine(&arbitrators, data.quorum);
 
             arbitrators_combinations.iter_mut().for_each(|combination| {
                 let mut new_combination = vec![part];
@@ -149,9 +220,7 @@ impl Multisig {
             let mut first_combination = true;
 
             for key in combination.iter() {
-                let xonly_key = key.x_only_public_key().0;
-
-                builder = builder.push_x_only_key(&xonly_key);
+                builder = builder.push_x_only_key(key);
 
                 builder = builder.push_opcode(if first_combination {
                     opcodes::all::OP_CHECKSIG
@@ -202,7 +271,7 @@ impl Multisig {
             data.network,
         );
 
-        return Multisig {
+        return Ok(Multisig {
             address,
             multisig_scripts,
             script_tree,
@@ -211,7 +280,7 @@ impl Multisig {
             quorum: data.quorum,
 
             secp,
-        };
+        });
     }
 
     /// # Returns
@@ -257,7 +326,8 @@ impl Multisig {
     /// # Args
     /// - `data`: Data to start transactions spending
     /// # Returns
-    /// A Partial Signed Bitcoin Transaction (PSBT) that contains the given UTXO's and outputs
+    /// A Partial Signed Bitcoin Transaction (PSBT) that contains the given UTXO's and outputs,
+    /// or an error if the requested script is not in this multisig's tree.
     /// configured to be unlocked with the given redeem script.
     /// # Usage
     /// ```ignore
@@ -266,7 +336,8 @@ impl Multisig {
     /// use bitcoin::{ScriptBuf, TxOut};
     /// use bitcoin::absolute::LockTime;
     ///
-    /// let multisig = Multisig::new(MultisigData {/* Multisig data */});
+    /// let multisig = Multisig::new(MultisigData {/* Multisig data */})
+    ///     .expect("valid multisig configuration");
     ///
     /// // Select it considering the combination field to unlock
     /// let script_to_select = 0;
@@ -284,9 +355,9 @@ impl Multisig {
     ///     outs,
     ///     // Send it as none if you don't want to use locktime condition
     ///     lock_time: Some(lock_time),
-    /// });
+    /// }).expect("script is in the tree");
     /// ```
-    pub fn start_tx_spending(&self, data: SpendingData) -> Psbt {
+    pub fn start_tx_spending(&self, data: SpendingData) -> Result<Psbt, SpendingError> {
         let unsigned_tx = Transaction {
             version: transaction::Version::TWO,
             input: data
@@ -311,7 +382,7 @@ impl Multisig {
 
         let control_block = spend_info
             .control_block(&(data.redeem_script.clone(), LeafVersion::TapScript))
-            .unwrap();
+            .ok_or(SpendingError::ScriptNotFound)?;
 
         data.utxos.iter().enumerate().for_each(|(i, utxo)| {
             let input = &mut psbt.inputs[i];
@@ -326,6 +397,6 @@ impl Multisig {
             );
         });
 
-        return psbt;
+        return Ok(psbt);
     }
 }

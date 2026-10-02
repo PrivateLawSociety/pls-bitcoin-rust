@@ -6,7 +6,7 @@ mod multisig_mount_tests {
     use bitcoin::key::Keypair;
     use bitcoin::script::Builder;
     use bitcoin::secp256k1::rand::thread_rng;
-    use bitcoin::secp256k1::{PublicKey, Secp256k1, SecretKey};
+    use bitcoin::secp256k1::{Secp256k1, SecretKey};
     use bitcoin::taproot::{TapTree, TaprootBuilder};
     use bitcoin::{opcodes, Address, Network, ScriptBuf, XOnlyPublicKey};
 
@@ -59,15 +59,19 @@ mod multisig_mount_tests {
         let network = Network::Regtest;
 
         let multisig = Multisig::new(MultisigData {
-            parts: parts.iter().map(|part| part.public_key()).collect(),
+            parts: parts
+                .iter()
+                .map(|part| part.x_only_public_key().0)
+                .collect(),
             quorum,
             arbitrators: arbitrators
                 .iter()
-                .map(|arbitrator| arbitrator.public_key())
+                .map(|arbitrator| arbitrator.x_only_public_key().0)
                 .collect(),
             internal_pubkey,
             network,
-        });
+        })
+        .unwrap();
 
         assert_eq!(network, multisig.network());
 
@@ -91,16 +95,16 @@ mod multisig_mount_tests {
             });
         });
 
-        let combinations_pubkeys: Vec<Vec<PublicKey>> = combinations
+        let combinations_pubkeys: Vec<Vec<XOnlyPublicKey>> = combinations
             .iter()
             .map(|combination| {
                 combination
                     .iter()
-                    .map(|keypair| PublicKey::from_secret_key(&secp, &keypair.secret_key()))
+                    .map(|keypair| keypair.x_only_public_key().0)
                     .collect()
             })
             .collect();
-        let multisig_combinations_pubkeys: Vec<Vec<PublicKey>> = multisig
+        let multisig_combinations_pubkeys: Vec<Vec<XOnlyPublicKey>> = multisig
             .scripts()
             .iter()
             .map(|script| script.combination.clone())
@@ -149,11 +153,11 @@ mod multisig_mount_tests {
                 let script = scripts[i].clone();
 
                 let multisig_combination_is_parts = multisig_script.combination.iter().all(|key| {
-                    let pubkeys = parts
+                    let pubkeys: Vec<XOnlyPublicKey> = parts
                         .clone()
                         .iter()
-                        .map(|keypair| keypair.public_key())
-                        .collect::<Vec<PublicKey>>();
+                        .map(|keypair| keypair.x_only_public_key().0)
+                        .collect();
                     pubkeys.contains(key)
                 });
 
@@ -163,10 +167,10 @@ mod multisig_mount_tests {
                     multisig_script.weight
                 );
 
-                let combination: Vec<PublicKey> = combinations[i]
+                let combination: Vec<XOnlyPublicKey> = combinations[i]
                     .clone()
                     .iter()
-                    .map(|keypair| keypair.public_key())
+                    .map(|keypair| keypair.x_only_public_key().0)
                     .collect();
 
                 assert_eq!(combination, multisig_script.combination);
@@ -199,6 +203,7 @@ mod multisig_mount_tests {
 }
 
 mod multisig_spending_tests {
+    use core::time;
     use std::collections::{HashMap, HashSet};
     use std::time::Duration;
     use std::{assert_matches, println, vec};
@@ -210,13 +215,14 @@ mod multisig_spending_tests {
     use bitcoin::consensus::encode::serialize_hex;
     use bitcoin::key::Keypair;
     use bitcoin::secp256k1::rand::thread_rng;
-    use bitcoin::secp256k1::{Message, PublicKey, Secp256k1, SecretKey};
+    use bitcoin::secp256k1::{Message, Secp256k1, SecretKey, XOnlyPublicKey};
     use bitcoin::sighash::{Prevouts, SighashCache};
     use bitcoin::taproot::{self, LeafVersion};
     use bitcoin::{
         Address, Amount, Network, OutPoint, PrivateKey, TapLeafHash, TapSighashType, TxOut, Txid,
         Witness,
     };
+    use nigiri_rs::fixtures::Fixture;
     use nigiri_rs::{Bitcoin, BitcoinUtxo, NigiriClient, NigiriError};
     use rstest::rstest;
 
@@ -225,14 +231,16 @@ mod multisig_spending_tests {
     #[case(5, 2, 2)]
     #[case(2, 3, 2)]
     #[case(2, 3, 1)]
-    #[nigiri_rs::test]
+    #[tokio::test]
     async fn it_spends_multisig_values(
-        #[ignore] client: NigiriClient<Bitcoin>,
         #[case] parts_count: usize,
         #[case] arbitrators_count: usize,
         #[case] quorum: usize,
         #[values(0, 1, 5)] blocks_to_lock: usize,
     ) {
+        let fixture = Fixture::<Bitcoin>::start().await.unwrap();
+        let client: NigiriClient<Bitcoin> = fixture.client().clone();
+
         let secp = Secp256k1::new();
         let rng = &mut thread_rng();
 
@@ -260,15 +268,19 @@ mod multisig_spending_tests {
         let network = Network::Regtest;
 
         let multisig = Multisig::new(MultisigData {
-            parts: parts.iter().map(|part| part.public_key()).collect(),
+            parts: parts
+                .iter()
+                .map(|part| part.x_only_public_key().0)
+                .collect(),
             quorum,
             arbitrators: arbitrators
                 .iter()
-                .map(|arbitrator| arbitrator.public_key())
+                .map(|arbitrator| arbitrator.x_only_public_key().0)
                 .collect(),
             internal_pubkey,
             network,
-        });
+        })
+        .unwrap();
 
         let ghost_address = {
             let secret_key = PrivateKey::new(SecretKey::new(rng), network);
@@ -277,14 +289,14 @@ mod multisig_spending_tests {
             Address::p2pkh(public_key.pubkey_hash(), network)
         };
 
-        let mut all_keypairs: HashMap<PublicKey, Keypair> = HashMap::new();
+        let mut all_keypairs: HashMap<XOnlyPublicKey, Keypair> = HashMap::new();
 
         parts.clone().into_iter().for_each(|part| {
-            all_keypairs.insert(part.public_key(), part);
+            all_keypairs.insert(part.x_only_public_key().0, part);
         });
 
         arbitrators.clone().into_iter().for_each(|arbitrator| {
-            all_keypairs.insert(arbitrator.public_key(), arbitrator);
+            all_keypairs.insert(arbitrator.x_only_public_key().0, arbitrator);
         });
 
         for (i, redeem_script) in multisig.scripts().iter().enumerate() {
@@ -303,6 +315,8 @@ mod multisig_spending_tests {
                 .wait_for_confirmation(&txid, Duration::MAX)
                 .await
                 .unwrap();
+
+            tokio::time::sleep(time::Duration::from_millis(100)).await;
 
             let outputs = client
                 .get_utxos(&multisig.address().to_string())
@@ -367,12 +381,14 @@ mod multisig_spending_tests {
                 None
             };
 
-            let mut psbt = multisig.start_tx_spending(SpendingData {
-                redeem_script: redeem_script.leaf.clone(),
-                outs: outs.clone(),
-                utxos: utxos.clone(),
-                lock_time,
-            });
+            let mut psbt = multisig
+                .start_tx_spending(SpendingData {
+                    redeem_script: redeem_script.leaf.clone(),
+                    outs: outs.clone(),
+                    utxos: utxos.clone(),
+                    lock_time,
+                })
+                .unwrap();
 
             println!("unspent transaction vsize: {}", psbt.unsigned_tx.vsize());
 
@@ -414,21 +430,18 @@ mod multisig_spending_tests {
                         sighash_type: TapSighashType::Default,
                     };
 
-                    let (xonly_key, _) = keypair.x_only_public_key();
-
                     psbt.inputs[i]
                         .tap_script_sigs
-                        .insert((xonly_key, leaf_hash), final_signature);
+                        .insert((*public_key, leaf_hash), final_signature);
                 }
             }
 
             let is_completed = redeem_script.combination.iter().all(|public_key| {
-                let (xonly, _) = public_key.x_only_public_key();
-
-                psbt.inputs
-                    .clone()
-                    .iter()
-                    .all(|input| input.tap_script_sigs.contains_key(&(xonly, leaf_hash)))
+                psbt.inputs.clone().iter().all(|input| {
+                    input
+                        .tap_script_sigs
+                        .contains_key(&(*public_key, leaf_hash))
+                })
             });
 
             assert!(is_completed);
@@ -437,10 +450,9 @@ mod multisig_spending_tests {
                 let mut witness = Witness::new();
 
                 for public_key in redeem_script.combination.iter().rev() {
-                    let (xonly, _) = public_key.x_only_public_key();
                     let sig = input
                         .tap_script_sigs
-                        .get(&(xonly, leaf_hash))
+                        .get(&(*public_key, leaf_hash))
                         .unwrap()
                         .clone();
                     witness.push(sig.to_vec());
@@ -516,6 +528,7 @@ mod multisig_spending_tests {
             );
         }
 
+        fixture.shutdown().await.unwrap();
         println!("test finished");
     }
 }
